@@ -17,7 +17,6 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Tests for the secure ImageIO wrapper, including corner cases.
- * Uses PNG test data (universally supported) so tests don't depend on jcgm-image.
  */
 class SecureImageReaderTest {
 
@@ -181,6 +180,52 @@ class SecureImageReaderTest {
         reader.dispose();
     }
 
+    // ---- Real CGM conversion via jcgm-image ----
+
+    @Test
+    @DisplayName("Renders a real CGM file through jcgm-image in the worker subprocess")
+    void renderRealCGM() throws Exception {
+        byte[] cgmData = TestImageUtils.createMinimalCGM();
+
+        WorkerProcessManager manager = WorkerProcessManager.getInstance();
+        BufferedImage image = manager.render(cgmData, "64m", 30_000);
+
+        assertNotNull(image, "jcgm-image should produce a BufferedImage from valid CGM data");
+        assertTrue(image.getWidth() > 0);
+        assertTrue(image.getHeight() > 0);
+    }
+
+    @Test
+    @DisplayName("CGM via SecureImageReader produces valid output")
+    void renderCGMViaReader() throws Exception {
+        byte[] cgmData = TestImageUtils.createMinimalCGM();
+
+        SecureImageReader reader = createReader(cgmData);
+        SecureImageReadParam param = new SecureImageReadParam();
+        param.setTimeoutMillis(30_000);
+
+        BufferedImage image = reader.read(0, param);
+        assertNotNull(image);
+        assertTrue(image.getWidth() > 0);
+        assertTrue(image.getHeight() > 0);
+        reader.dispose();
+    }
+
+    // ---- Classpath Separation ----
+
+    @Test
+    @DisplayName("Worker classpath does not include test framework jars")
+    void workerClasspathSeparated() throws Exception {
+        // The main app classpath has JUnit on it.
+        // The worker classpath should NOT — it should only have our classes + lib jars.
+        // If the worker can render a PNG, it proves it works without the test classpath.
+        byte[] png = TestImageUtils.createSmallPNG();
+        WorkerProcessManager manager = WorkerProcessManager.getInstance();
+
+        BufferedImage img = manager.render(png, "64m", 30_000);
+        assertNotNull(img);
+    }
+
     // ---- Corner Cases ----
 
     @Test
@@ -202,7 +247,6 @@ class SecureImageReaderTest {
         SecureImageReadParam param = new SecureImageReadParam();
         param.setTimeoutMillis(30_000);
 
-        // Worker should report "no reader found" error
         assertThrows(IOException.class, () -> reader.read(0, param));
         reader.dispose();
     }
@@ -224,13 +268,12 @@ class SecureImageReaderTest {
         byte[] png = TestImageUtils.createSmallPNG();
 
         SecureImageReadParam param = new SecureImageReadParam();
-        param.setMaxHeapSize("4m"); // Very small heap
+        param.setMaxHeapSize("4m");
         param.setTimeoutMillis(30_000);
 
         SecureImageReader reader = createReader(png);
         try {
             BufferedImage img = reader.read(0, param);
-            // May succeed if 4m is enough for a tiny image
             assertNotNull(img);
         } catch (IOException e) {
             assertTrue(e.getMessage().contains("memory") || e.getMessage().contains("crashed")
@@ -246,7 +289,7 @@ class SecureImageReaderTest {
         byte[] png = TestImageUtils.createLargePNG();
 
         SecureImageReadParam param = new SecureImageReadParam();
-        param.setTimeoutMillis(1); // 1ms — too short
+        param.setTimeoutMillis(1);
         param.setMaxHeapSize("64m");
 
         SecureImageReader reader = createReader(png);

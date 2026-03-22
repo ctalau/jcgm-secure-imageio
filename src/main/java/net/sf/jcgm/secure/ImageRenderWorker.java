@@ -1,15 +1,25 @@
 package net.sf.jcgm.secure;
 
 import javax.imageio.ImageIO;
+import javax.imageio.spi.IIORegistry;
+import javax.imageio.spi.ImageReaderSpi;
 import java.awt.image.BufferedImage;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
-import java.security.Permission;
+import java.util.Iterator;
 
 /**
  * Subprocess entry point for secure image rendering.
  * Format-agnostic — delegates to whatever ImageIO readers are on the classpath
  * (e.g. jcgm-image for CGM files).
+ *
+ * <p>Security is enforced externally via:
+ * <ul>
+ *   <li>{@code -Djava.security.manager} with a restrictive policy file
+ *       ({@code worker-security.policy}) that only allows reading specific paths</li>
+ *   <li>{@code -Xmx} memory limits</li>
+ *   <li>Separate classpath (only worker + decoder jars, no application classes)</li>
+ * </ul>
  *
  * <p>Protocol (all values big-endian):
  * <ul>
@@ -23,7 +33,9 @@ public class ImageRenderWorker {
     private static final int MAX_INPUT_SIZE = 100 * 1024 * 1024; // 100 MB
 
     public static void main(String[] args) {
-        installSecurityRestrictions();
+        // Deregister our secure wrapper SPI to prevent recursive subprocess spawning.
+        // The worker should only use the real decoders (e.g. jcgm-image's CGMImageReader).
+        deregisterSecureSpis();
 
         try {
             DataInputStream in = new DataInputStream(System.in);
@@ -72,64 +84,27 @@ public class ImageRenderWorker {
         }
     }
 
+    private static void deregisterSecureSpis() {
+        IIORegistry registry = IIORegistry.getDefaultInstance();
+        // Collect first, then deregister to avoid ConcurrentModificationException
+        java.util.List<ImageReaderSpi> toRemove = new java.util.ArrayList<>();
+        Iterator<ImageReaderSpi> spis = registry.getServiceProviders(ImageReaderSpi.class, false);
+        while (spis.hasNext()) {
+            ImageReaderSpi spi = spis.next();
+            if (spi instanceof SecureImageReaderSpi) {
+                toRemove.add(spi);
+            }
+        }
+        for (ImageReaderSpi spi : toRemove) {
+            registry.deregisterServiceProvider(spi, ImageReaderSpi.class);
+        }
+    }
+
     private static void writeError(DataOutputStream out, String message) throws IOException {
         byte[] msgBytes = message.getBytes(StandardCharsets.UTF_8);
         out.writeByte(1);
         out.writeInt(msgBytes.length);
         out.write(msgBytes);
         out.flush();
-    }
-
-    @SuppressWarnings("removal")
-    private static void installSecurityRestrictions() {
-        // SecurityManager is deprecated in Java 17 but still functional.
-        // The subprocess is started with -Djava.security.manager=allow.
-        try {
-            System.setSecurityManager(new SecurityManager() {
-                @Override
-                public void checkPermission(Permission perm) {
-                    // Allow reading system properties
-                    if (perm instanceof java.util.PropertyPermission
-                            && "read".equals(perm.getActions())) {
-                        return;
-                    }
-
-                    // Allow runtime permissions needed for classloading and I/O
-                    if (perm instanceof RuntimePermission) {
-                        String name = perm.getName();
-                        if (name.startsWith("access") || name.equals("getenv.*")
-                                || name.equals("createClassLoader")
-                                || name.equals("getClassLoader")
-                                || name.equals("setSecurityManager")
-                                || name.startsWith("loadLibrary")
-                                || name.equals("readFileDescriptor")
-                                || name.equals("writeFileDescriptor")) {
-                            return;
-                        }
-                    }
-
-                    // Allow reading files (classpath JARs, font files, etc.)
-                    if (perm instanceof FilePermission) {
-                        if ("read".equals(perm.getActions())) {
-                            return;
-                        }
-                        throw new SecurityException("File write/execute denied: " + perm);
-                    }
-
-                    // Deny network access
-                    if (perm instanceof java.net.SocketPermission
-                            || perm instanceof java.net.NetPermission) {
-                        throw new SecurityException("Network access denied: " + perm);
-                    }
-                }
-
-                @Override
-                public void checkPermission(Permission perm, Object context) {
-                    checkPermission(perm);
-                }
-            });
-        } catch (Exception e) {
-            System.err.println("WARNING: Could not install SecurityManager: " + e.getMessage());
-        }
     }
 }

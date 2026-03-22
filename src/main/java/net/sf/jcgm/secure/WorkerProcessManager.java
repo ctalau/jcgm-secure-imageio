@@ -3,20 +3,31 @@ package net.sf.jcgm.secure;
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.*;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Manages worker subprocesses for secure image rendering.
  * Enforces at most one active worker process at a time using a fair semaphore.
  * Additional requests queue up in FIFO order.
  *
- * <p>Format-agnostic — the subprocess uses standard {@link ImageIO#read}
- * with whatever readers are on the classpath.
+ * <p>The worker subprocess runs with a <b>separate classpath</b> containing only:
+ * <ul>
+ *   <li>Our own classes (for {@link ImageRenderWorker})</li>
+ *   <li>Image decoder jars from the {@code lib/} directory (e.g. jcgm-core, jcgm-image)</li>
+ * </ul>
+ *
+ * <p>The worker is locked down with a {@code worker-security.policy} that restricts
+ * file reads to only {@code java.home}, the lib jars, and {@code java.io.tmpdir}.
+ * No network access, no process execution, no writes outside tmpdir.
  */
 public class WorkerProcessManager {
 
@@ -24,7 +35,17 @@ public class WorkerProcessManager {
 
     private final Semaphore semaphore = new Semaphore(1, true); // fair FIFO ordering
 
+    /** Directory containing decoder jars (jcgm-core, jcgm-image). */
+    private Path libDir;
+
+    /** Path to our own classes or jar (for the worker classpath). */
+    private Path classesDir;
+
+    /** Path to the security policy file. */
+    private Path policyFile;
+
     private WorkerProcessManager() {
+        resolveDefaults();
     }
 
     public static WorkerProcessManager getInstance() {
@@ -45,25 +66,31 @@ public class WorkerProcessManager {
         }
     }
 
-    /** Returns the number of requests currently queued (waiting for the semaphore). */
+    /** Override the library directory containing decoder jars. */
+    public void setLibDir(Path libDir) {
+        this.libDir = libDir;
+    }
+
+    /** Override the classes/jar location for the worker. */
+    public void setClassesDir(Path classesDir) {
+        this.classesDir = classesDir;
+    }
+
+    /** Override the security policy file path. */
+    public void setPolicyFile(Path policyFile) {
+        this.policyFile = policyFile;
+    }
+
     public int getQueueLength() {
         return semaphore.getQueueLength();
     }
 
-    /** Returns true if no render is currently active. */
     public boolean isIdle() {
         return semaphore.availablePermits() > 0;
     }
 
     /**
      * Renders image data to a BufferedImage by delegating to an isolated subprocess.
-     *
-     * @param imageData   raw image file bytes (any format supported by ImageIO readers on classpath)
-     * @param maxHeap     max heap for the worker (e.g., "64m")
-     * @param timeoutMs   max time to wait for rendering (includes queue wait + processing)
-     * @return the rendered image
-     * @throws IOException          if rendering fails
-     * @throws InterruptedException if the thread is interrupted while waiting
      */
     public BufferedImage render(byte[] imageData, String maxHeap, long timeoutMs)
             throws IOException, InterruptedException {
@@ -87,18 +114,27 @@ public class WorkerProcessManager {
     private BufferedImage executeWorker(byte[] imageData, String maxHeap, long timeoutMs)
             throws IOException {
 
-        String javaHome = System.getProperty("java.home");
-        String javaBin = Path.of(javaHome, "bin", "java").toString();
-        String classpath = System.getProperty("java.class.path");
+        String javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+
+        // Build worker-only classpath: our classes + lib/*.jar
+        String workerClasspath = buildWorkerClasspath();
 
         List<String> command = new ArrayList<>();
         command.add(javaBin);
         command.add("-Xmx" + maxHeap);
         command.add("-XX:+UseSerialGC");
-        command.add("-Djava.security.manager=allow");
         command.add("-Djava.awt.headless=true");
+
+        // Security manager with policy file
+        if (policyFile != null && Files.exists(policyFile)) {
+            command.add("-Djava.security.manager");
+            command.add("-Djava.security.policy==" + policyFile.toAbsolutePath());
+            command.add("-Dworker.lib.dir=" + libDir.toAbsolutePath());
+            command.add("-Dworker.classes.dir=" + classesDir.toAbsolutePath());
+        }
+
         command.add("-cp");
-        command.add(classpath);
+        command.add(workerClasspath);
         command.add(ImageRenderWorker.class.getName());
 
         ProcessBuilder pb = new ProcessBuilder(command);
@@ -106,7 +142,6 @@ public class WorkerProcessManager {
 
         Process process = pb.start();
         try {
-            // Send image data to worker
             DataOutputStream workerIn = new DataOutputStream(
                     new BufferedOutputStream(process.getOutputStream()));
             workerIn.writeInt(imageData.length);
@@ -120,7 +155,6 @@ public class WorkerProcessManager {
                 throw new IOException("Worker process timed out after " + timeoutMs + "ms");
             }
 
-            // Read response
             DataInputStream workerOut = new DataInputStream(
                     new BufferedInputStream(process.getInputStream()));
 
@@ -153,6 +187,87 @@ public class WorkerProcessManager {
             throw new IOException("Worker interrupted", e);
         } finally {
             process.destroyForcibly();
+        }
+    }
+
+    /**
+     * Builds a classpath containing only:
+     * 1. Our own classes/jar (for ImageRenderWorker)
+     * 2. Decoder jars from lib/ (jcgm-core, jcgm-image, etc.)
+     *
+     * This is intentionally separate from the parent's classpath.
+     */
+    private String buildWorkerClasspath() throws IOException {
+        List<String> entries = new ArrayList<>();
+
+        // Our own classes
+        entries.add(classesDir.toAbsolutePath().toString());
+
+        // All jars in the lib directory
+        if (libDir != null && Files.isDirectory(libDir)) {
+            try (Stream<Path> jars = Files.list(libDir)) {
+                jars.filter(p -> p.toString().endsWith(".jar"))
+                        .map(p -> p.toAbsolutePath().toString())
+                        .forEach(entries::add);
+            }
+        }
+
+        return String.join(File.pathSeparator, entries);
+    }
+
+    /**
+     * Resolves default paths for lib dir, classes dir, and policy file.
+     * Tries (in order):
+     * 1. System property {@code jcgm.secure.project.dir} (set by Maven surefire)
+     * 2. Location of this class's jar/classes
+     */
+    private void resolveDefaults() {
+        // Try system property first (for Maven test runs)
+        String projectDir = System.getProperty("jcgm.secure.project.dir");
+        if (projectDir != null) {
+            Path base = Path.of(projectDir);
+            this.libDir = base.resolve("lib");
+            this.classesDir = base.resolve("target/classes");
+            this.policyFile = this.classesDir.resolve("worker-security.policy");
+            return;
+        }
+
+        // Resolve from our own class location
+        try {
+            Path myLocation = Path.of(
+                    WorkerProcessManager.class.getProtectionDomain()
+                            .getCodeSource().getLocation().toURI());
+
+            if (Files.isDirectory(myLocation)) {
+                // Running from classes/ directory (e.g. IDE)
+                this.classesDir = myLocation;
+                // lib/ is a sibling of the classes root project
+                Path projectRoot = myLocation.getParent().getParent(); // target/classes -> target -> project
+                this.libDir = projectRoot.resolve("lib");
+                this.policyFile = myLocation.resolve("worker-security.policy");
+            } else {
+                // Running from a jar
+                this.classesDir = myLocation;
+                this.libDir = myLocation.getParent().resolve("lib");
+                this.policyFile = extractPolicyFile();
+            }
+        } catch (URISyntaxException e) {
+            throw new RuntimeException("Cannot resolve worker paths", e);
+        }
+    }
+
+    /**
+     * When running from a jar, extract the policy file to a temp location.
+     */
+    private Path extractPolicyFile() {
+        try (InputStream is = getClass().getResourceAsStream("/worker-security.policy")) {
+            if (is == null) return null;
+            Path tmp = Files.createTempFile("worker-security", ".policy");
+            tmp.toFile().deleteOnExit();
+            Files.copy(is, tmp, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            return tmp;
+        } catch (IOException e) {
+            return null;
         }
     }
 

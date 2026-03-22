@@ -1,0 +1,41 @@
+// Security policy for the ImageRenderWorker subprocess.
+// Uses "==" in -Djava.security.policy== to replace (not extend) the default policy.
+//
+// Paths are passed as system properties by the parent process:
+//   worker.lib.dir  — directory containing jcgm jars
+//   java.home       — JDK location (set by JVM)
+//   java.io.tmpdir  — temp directory (set by JVM)
+
+grant {
+    // --- File read: only JDK, worker lib jars, and temp dir ---
+    permission java.io.FilePermission "${java.home}/-", "read";
+    permission java.io.FilePermission "${worker.lib.dir}/-", "read";
+    permission java.io.FilePermission "${worker.classes.dir}/-", "read";
+
+    // ImageIO and AWT may use temp files for image processing
+    permission java.io.FilePermission "${java.io.tmpdir}/-", "read,write,delete";
+    permission java.io.FilePermission "${java.io.tmpdir}", "read,write";
+
+    // --- Runtime permissions needed for classloading and AWT ---
+    permission java.lang.RuntimePermission "accessDeclaredMembers";
+    permission java.lang.RuntimePermission "accessClassInPackage.*";
+    permission java.lang.RuntimePermission "createClassLoader";
+    permission java.lang.RuntimePermission "getClassLoader";
+    permission java.lang.RuntimePermission "loadLibrary.*";
+    permission java.lang.RuntimePermission "readFileDescriptor";
+    permission java.lang.RuntimePermission "writeFileDescriptor";
+    permission java.lang.RuntimePermission "modifyThread";
+    permission java.lang.RuntimePermission "getProtectionDomain";
+
+    // --- Property read: allow reading any system property ---
+    permission java.util.PropertyPermission "*", "read";
+
+    // --- Reflection for AWT/ImageIO internals ---
+    permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
+
+    // --- Explicitly DENY (by omission): ---
+    // - java.net.SocketPermission     (no network)
+    // - java.io.FilePermission "execute" (no process execution)
+    // - java.io.FilePermission on arbitrary paths (no reading outside allowed dirs)
+    // - java.util.PropertyPermission "write" (no property modification)
+};
