@@ -13,15 +13,18 @@ import java.util.Iterator;
 import java.util.List;
 
 /**
- * A secure ImageIO reader for CGM files.
- * Delegates actual CGM parsing and rendering to an isolated subprocess
- * managed by {@link WorkerProcessManager}.
+ * Abstract secure ImageIO reader that delegates actual image decoding to
+ * an isolated subprocess. The subprocess uses standard {@code ImageIO.read()}
+ * with the real decoder (e.g. jcgm-image) on its classpath.
+ *
+ * <p>Subclasses only need to exist to register format-specific SPI metadata.
+ * No format-specific parsing logic belongs here.
  */
-public class SecureCGMImageReader extends ImageReader {
+public class SecureImageReader extends ImageReader {
 
-    private byte[] cgmData;
+    private byte[] imageData;
 
-    protected SecureCGMImageReader(ImageReaderSpi originatingProvider) {
+    protected SecureImageReader(ImageReaderSpi originatingProvider) {
         super(originatingProvider);
     }
 
@@ -33,13 +36,16 @@ public class SecureCGMImageReader extends ImageReader {
     @Override
     public int getWidth(int imageIndex) throws IOException {
         checkIndex(imageIndex);
-        return getReadParam().getWidth();
+        // Width is determined by the delegate reader in the subprocess;
+        // we cannot know it without decoding. Return -1 per ImageReader contract
+        // to indicate "unknown until read".
+        return -1;
     }
 
     @Override
     public int getHeight(int imageIndex) throws IOException {
         checkIndex(imageIndex);
-        return getReadParam().getHeight();
+        return -1;
     }
 
     @Override
@@ -63,20 +69,18 @@ public class SecureCGMImageReader extends ImageReader {
     @Override
     public BufferedImage read(int imageIndex, ImageReadParam param) throws IOException {
         checkIndex(imageIndex);
-        readCGMData();
+        loadImageData();
 
-        SecureCGMImageReadParam readParam;
-        if (param instanceof SecureCGMImageReadParam p) {
+        SecureImageReadParam readParam;
+        if (param instanceof SecureImageReadParam p) {
             readParam = p;
         } else {
-            readParam = getReadParam();
+            readParam = new SecureImageReadParam();
         }
 
         try {
             return WorkerProcessManager.getInstance().render(
-                    cgmData,
-                    readParam.getWidth(),
-                    readParam.getHeight(),
+                    imageData,
                     readParam.getMaxHeapSize(),
                     readParam.getTimeoutMillis()
             );
@@ -88,15 +92,11 @@ public class SecureCGMImageReader extends ImageReader {
 
     @Override
     public ImageReadParam getDefaultReadParam() {
-        return new SecureCGMImageReadParam();
+        return new SecureImageReadParam();
     }
 
-    private SecureCGMImageReadParam getReadParam() {
-        return new SecureCGMImageReadParam();
-    }
-
-    private void readCGMData() throws IOException {
-        if (cgmData != null) return;
+    private void loadImageData() throws IOException {
+        if (imageData != null) return;
 
         Object inputObj = getInput();
         if (inputObj == null) {
@@ -112,9 +112,9 @@ public class SecureCGMImageReader extends ImageReader {
         while ((n = stream.read(buf)) > 0) {
             baos.write(buf, 0, n);
         }
-        cgmData = baos.toByteArray();
-        if (cgmData.length == 0) {
-            throw new IOException("Empty CGM input");
+        imageData = baos.toByteArray();
+        if (imageData.length == 0) {
+            throw new IOException("Empty image input");
         }
     }
 
@@ -126,7 +126,7 @@ public class SecureCGMImageReader extends ImageReader {
 
     @Override
     public void dispose() {
-        cgmData = null;
+        imageData = null;
         super.dispose();
     }
 }
